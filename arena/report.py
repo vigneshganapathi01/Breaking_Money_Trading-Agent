@@ -97,9 +97,27 @@ def write(j: Journal, run_id: int, path: str | Path, live: bool = False) -> Path
                 f'<td class="n">{t["entry_ts"][11:16]}→{t["exit_ts"][11:16]}</td><td class="n">{t["charges"]:.2f}</td>'
                 f'<td class="n {_cls(t["net_pnl"])}">{_rs(t["net_pnl"], True)}</td><td>{_e(t["exit_reason"].replace("_", " "))}</td></tr>')
 
+    def decided_by(c):
+        # Who made this call: the Judge after a debate, a single Claude brain, or the fixed rules strategy.
+        if (c["reason"] or "").startswith("[debate #"):
+            return '<span class="act judge">⚖️ Judge</span>'
+        if (c["brain"] or "").startswith("claude"):
+            return '<span class="act claude">Claude</span>'
+        return '<span class="act rules">Rules</span>'
+
+    def reason_cell(text):
+        # Long Judge rationales: show the start, the rest one click away (never cut off mid-word).
+        text = text or ""
+        if len(text) <= 320:
+            return _e(text)
+        cut = text.rfind(" ", 0, 300)
+        cut = cut if cut > 0 else 300
+        return (f'<details><summary>{_e(text[:cut])} … <span class="muted">read full reason</span></summary>'
+                f'{_e(text[cut:])}</details>')
+
     def call_row(c):
         return (f'<tr><td class="n">{_e(c["ts"][5:16].replace("T", " "))}</td><td><span class="act {c["action"].lower()}">{c["action"]}</span></td>'
-                f'<td>{_e(c["symbol"])}</td><td class="n">{(c["confidence"] or 0):.2f}</td><td class="r">{_e(c["reason"])}</td>'
+                f'<td>{decided_by(c)}</td><td>{_e(c["symbol"])}</td><td class="n">{(c["confidence"] or 0):.2f}</td><td class="r">{reason_cell(c["reason"])}</td>'
                 f'<td class="r muted">{_e(c["outcome"])}</td></tr>')
 
     def split_rows(rows, fn, head, cols, empty, first=25):
@@ -115,8 +133,8 @@ def write(j: Journal, run_id: int, path: str | Path, live: bool = False) -> Path
                             "<tr><th>Date</th><th>Stock</th><th>Qty</th><th>Entry</th><th>Exit</th><th>Time</th><th>Charges</th><th>Net P&amp;L</th><th>Exit reason</th></tr>",
                             9, "No closed trades yet.")
     call_rows = split_rows(calls, call_row,
-                           "<tr><th>Time</th><th>Call</th><th>Stock</th><th>Conf.</th><th>Reason</th><th>Engine result</th></tr>",
-                           6, "No BUY/SELL calls yet.", first=15)
+                           "<tr><th>Time</th><th>Call</th><th>Decided by</th><th>Stock</th><th>Conf.</th><th>Reason</th><th>Engine result</th></tr>",
+                           7, "No BUY/SELL calls yet.", first=15)
 
 
     run_notes = ins.run_insights(j, run_id)
@@ -265,6 +283,7 @@ td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap} td.r
 tr.me td{background:rgba(57,135,229,.08)}
 .act{font-size:10.5px;font-weight:800;padding:2px 7px;border-radius:6px;letter-spacing:.06em}
 .act.buy{background:rgba(12,163,12,.16);color:var(--up)} .act.sell{background:rgba(208,59,59,.16);color:var(--down)}
+.act.judge{background:rgba(250,178,25,.16);color:#fab219} .act.rules{background:rgba(140,150,170,.16);color:#9aa3b5} .act.claude{background:rgba(120,140,255,.16);color:#8fa2ff}
 ul{margin:0;padding-left:18px} li{margin:4px 0}
 details{border-top:1px solid var(--line);padding:8px 0} summary{cursor:pointer}
 .md h3{font-size:14px;margin:14px 0 6px;color:var(--accent)} .md p{margin:6px 0}
@@ -296,7 +315,7 @@ footer{color:var(--muted);font-size:11px;margin-top:24px;text-align:center}
 <section class="card"><h2>P&amp;L by stock</h2><div class="tbl"><table><tr><th>Stock</th><th>Trades</th><th>Win%</th><th>Net</th></tr>{{BYSYM}}</table></div></section>
 <section class="card"><h2>P&amp;L by exit reason</h2><div class="tbl"><table><tr><th>Exit</th><th>Trades</th><th>Win%</th><th>Net</th></tr>{{BYEXIT}}</table></div></section>
 <section class="card wide"><h2>Day-by-day notes</h2>{{DAYNOTES}}</section>
-<section class="card wide"><h2>Claude's calls <small>latest BUY/SELL calls · {{NHOLDS}} HOLDs not shown</small></h2><div class="tbl">{{CALLS}}</div></section>
+<section class="card wide"><h2>Buy &amp; sell calls <small>⚖️ Judge = after a Bull vs Bear debate · Rules = fixed strategy, no Claude · latest BUY/SELL calls · {{NHOLDS}} HOLDs not shown</small></h2><div class="tbl">{{CALLS}}</div></section>
 <section class="card wide"><h2>Trade log</h2><div class="tbl">{{TRADES}}</div></section>
 <section class="card wide"><h2>Leaderboard <small>all runs in this database</small></h2><div class="tbl"><table><tr><th>Run</th><th>Name</th><th>Brain</th><th>Mode</th><th>Realised P&amp;L</th><th>Return</th><th>Status</th></tr>{{BOARD}}</table></div></section>
 </div>

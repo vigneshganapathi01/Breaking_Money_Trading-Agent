@@ -42,6 +42,17 @@ def _brain_cfg(cfg: dict, brain: str | None) -> dict:
     return cfg
 
 
+class FeedMismatch(RuntimeError):
+    pass
+
+
+def check_same_feed(run: dict, feed_name: str) -> None:
+    """Never switch market-data provider silently in the middle of a challenge."""
+    if run.get("feed") and run["feed"] != feed_name:
+        raise FeedMismatch(f"Run #{run['id']} uses the '{run['feed']}' feed but config.toml now says '{feed_name}'. "
+                         "Switch back, or start a new challenge (--new) to change provider.")
+
+
 def _open(path: str | Path, no_open: bool) -> None:
     print(f"\nResults page: {path}")
     if not no_open:
@@ -66,6 +77,7 @@ def cmd_run(a, cfg):
     feed = make_live_feed(cfg)
     run = None if a.new else j.active_run("live")
     if run:
+        check_same_feed(run, feed.name)
         run_id = run["id"]
         log.info("Resuming live run #%d '%s'", run_id, run["name"])
     else:
@@ -159,6 +171,24 @@ def cmd_report(a, cfg):
     _open(out, a.no_open)
 
 
+def cmd_email_report(a, cfg):
+    from . import mailer
+    from .config import load_env
+    load_env()
+    j = Journal(cfg["paths"]["db"])
+    run = j.one("SELECT * FROM runs WHERE id=?", (a.run,)) if a.run else j.active_run("live") or j.latest_run()
+    if not run:
+        sys.exit("No runs yet.")
+    day = a.date or (j.one("SELECT MAX(substr(ts,1,10)) d FROM decisions WHERE run_id=?", (run["id"],)) or {}).get("d")
+    if not day:
+        sys.exit("No trading days in this run yet.")
+    subject, body = mailer.build(j, run["id"], day)
+    if a.dry_run:
+        print("Subject:", subject, "\n"); print(body); return
+    mailer.send(cfg, subject, body)
+    print(f"Sent '{subject}' to {mailer.recipient(cfg)}")
+
+
 def cmd_status(a, cfg):
     j = Journal(cfg["paths"]["db"])
     rows = j.q("SELECT r.id, r.name, r.mode, r.brain, r.status, r.starting_capital, a.cash, a.realized, a.charges "
@@ -241,7 +271,7 @@ def cmd_check(a, cfg):
 
 def cmd_gui(a, cfg):
     from .gui import serve
-    serve(a.port, not a.no_open)
+    serve(a.port, not a.no_open, a.resume, "0.0.0.0" if a.lan else "127.0.0.1")
 
 
 def main(argv=None):
@@ -252,16 +282,16 @@ def main(argv=None):
 
     r = sub.add_parser("run", help="live paper-trading session on real-time prices")
     r.add_argument("--new", action="store_true", help="start a fresh run instead of resuming")
-    r.add_argument("--name"); r.add_argument("--brain", choices=["auto", "claude-api", "claude-cli", "rules"])
+    r.add_argument("--name"); r.add_argument("--brain", choices=["auto", "claude-api", "claude-cli", "rules", "debate"])
 
     rp = sub.add_parser("replay", help="replay saved history without lookahead")
     rp.add_argument("--start"); rp.add_argument("--end"); rp.add_argument("--days", type=int)
-    rp.add_argument("--name"); rp.add_argument("--brain", choices=["auto", "claude-api", "claude-cli", "rules"])
+    rp.add_argument("--name"); rp.add_argument("--brain", choices=["auto", "claude-api", "claude-cli", "rules", "debate"])
     rp.add_argument("--no-open", action="store_true")
 
     d = sub.add_parser("demo", help="offline demo on synthetic prices")
     d.add_argument("--days", type=int, default=15); d.add_argument("--seed", type=int, default=7)
-    d.add_argument("--brain", choices=["auto", "claude-api", "claude-cli", "rules"]); d.add_argument("--no-open", action="store_true")
+    d.add_argument("--brain", choices=["auto", "claude-api", "claude-cli", "rules", "debate"]); d.add_argument("--no-open", action="store_true")
 
     f = sub.add_parser("fetch", help="download history for replay")
     f.add_argument("--source", choices=["yahoo", "upstox"], default="yahoo")
@@ -273,19 +303,31 @@ def main(argv=None):
     rep.add_argument("--brain", choices=["claude-api", "claude-cli"]); rep.add_argument("--no-open", action="store_true")
 
     sub.add_parser("status", help="list runs and their P&L")
+    em = sub.add_parser("email-report", help="email the Judge's buy / don't-buy report for a day")
+    em.add_argument("--date", help="YYYY-MM-DD (default: latest trading day)"); em.add_argument("--run", type=int)
+    em.add_argument("--dry-run", action="store_true", help="print the email instead of sending it")
     c = sub.add_parser("compete", help="several brains on the same replay data")
     c.add_argument("--brains", default="rules,claude-api"); c.add_argument("--start"); c.add_argument("--end"); c.add_argument("--days", type=int)
     sub.add_parser("upstox-login", help="get today's Upstox market-data token")
     sub.add_parser("check", help="test safety guard, market data and Claude setup")
     g = sub.add_parser("gui", help="open the control panel in your browser")
     g.add_argument("--port", type=int, default=8787); g.add_argument("--no-open", action="store_true")
+    g.add_argument("--lan", action="store_true", help="also serve a VIEW-ONLY panel to devices on your Wi-Fi")
+    g.add_argument("--resume", action="store_true", help="continue the active live run on start (background service)")
 
     a = p.parse_args(argv)
     cfg = load_config(a.config)
     install_guards(cfg)
     setup_logging(cfg)
+    try:
+        _dispatch(a, cfg)
+    except FeedMismatch as e:
+        sys.exit(str(e))
+
+
+def _dispatch(a, cfg):
     {"run": cmd_run, "replay": cmd_replay, "demo": cmd_demo, "fetch": cmd_fetch, "report": cmd_report,
-     "status": cmd_status, "compete": cmd_compete, "upstox-login": cmd_upstox_login, "check": cmd_check, "gui": cmd_gui}[a.cmd](a, cfg)
+     "status": cmd_status, "email-report": cmd_email_report, "compete": cmd_compete, "upstox-login": cmd_upstox_login, "check": cmd_check, "gui": cmd_gui}[a.cmd](a, cfg)
 
 
 if __name__ == "__main__":

@@ -12,18 +12,20 @@ watchlist = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "BHARTI
 # NSE trading holidays (YYYY-MM-DD). Weekends are skipped automatically.
 # Copy the current list from the NSE website before you start a challenge.
 holidays = []
+# Quotes older than this block NEW paper entries (exits and stops still run). Yahoo can lag 1-3 minutes.
+max_quote_age_seconds = 300
 
 [strategy]
 # "balanced" uses the numbers below. "aggressive" = up to 3 concentrated positions of 35% each, 6% daily loss
 # limit, and only A+ momentum breakouts with quick profit-taking (it overrides the matching settings below).
 profile = "balanced"
 # Who makes the calls: "auto" picks your Claude Code login if installed, else an API key, else the free rules strategy.
-# Or force one: "claude-cli", "claude-api", "rules"
-brain = "auto"
+# Or force one: "claude-cli", "claude-api", "rules", or "debate" (multi-agent, see [debate] below; never chosen by auto)
+brain = "debate"
 model = "claude-opus-5-5"      # used by claude-api
 effort = "medium"              # low | medium | high: how hard Claude thinks per decision
 cli_model = ""                 # optional --model for claude-cli
-decision_minutes = 15          # Claude is asked for calls this often
+decision_minutes = 5           # a debate cycle runs this often (strategy proposes, Bull vs Bear, Judge decides)
 poll_seconds = 30              # prices are checked this often (stops/targets run on every poll)
 bar_minutes = 5                # candle size used for indicators
 product = "intraday"           # "intraday" = auto square-off every day; "delivery" = may hold overnight
@@ -36,6 +38,47 @@ default_target_pct = 3.0
 max_daily_loss_pct = 3.0       # kill switch: close everything and stop entries for the day
 # Free-text guidance passed to Claude. Use it to try different styles across the series.
 notes = ""
+
+[debate]
+# Used when brain = "debate": Bull vs Bear debate, Judge decides, the paper engine executes.
+# Every strategy BUY/SELL is debated first and is only TAKEN if the Judge approves it; otherwise it is LEFT.
+require_judge = true           # live sessions: reject any BUY/SELL without a matching Judge verdict (stops/targets/square-off still automatic)
+proposer = "rules"             # who suggests trades to debate: "rules" (free), "claude-api", "claude-cli" or "none" (events only)
+transport = "claude-cli"       # "claude-cli" (your Claude Code login, no API key) or "claude-api" (ANTHROPIC_API_KEY)
+rounds = 1                     # challenge/response rounds between the openings and the Bear's final word
+cooldown_minutes = 10          # no repeat debate on a stock within this window (material news can break through)
+max_debates_per_cycle = 1      # per decision cycle; one debate takes about 2-3 minutes via Claude Code
+max_debates_per_day = 80       # about 66 five-minute cycles in a session; this stops runaway usage
+max_daily_cost_usd = 20.0      # daily brake in API-equivalent dollars (claude-cli: nothing is charged, this only limits plan usage)
+min_judge_confidence = 0.6     # PAPER_BUY below this becomes HOLD
+# Triggers: a debate only starts when one of these fires
+price_move_pct = 1.0           # move since the last check/debate on that stock
+volume_spike_ratio = 2.0       # last bar volume vs 20-bar average
+breakout = true                # at day high with SMA9 > SMA21 (or at day low while holding)
+sma_cross = true
+news = true                    # material NSE filing for the stock
+
+[agents]
+# One debate = 6 Claude calls with rounds = 1 (Bull, Bear, Bear challenge, Bull reply, Bear final, Judge).
+# Current Claude models do not accept a temperature setting; "effort" (low/medium/high) controls depth and cost.
+model = "claude-opus-5-5"
+effort = "medium"
+# Per-agent overrides, for example:
+# [agents.judge]
+# effort = "high"
+
+[research]
+enabled = true
+sources = ["nse_announcements", "nse_results"]   # NSE's official RSS feeds
+# News headlines for the agents (context only, never a debate trigger):
+news_sources = ["google_news", "et_markets", "et_stocks", "moneycontrol_buzzing", "moneycontrol_latest", "livemint_markets"]
+market_mood = true             # Nifty 50, Nifty Bank and India VIX in every debate
+poll_minutes = 5
+news_trigger_minutes = 60      # a filing can trigger a debate within this window after publication
+lookback_hours = 24            # filings shown to the agents
+# Extra company-name matches for symbols in your watchlist, for example:
+# [research.aliases]
+# TATAMOTORS = ["tata motors"]
 
 [execution]
 spread_bps = 4                 # assumed bid-ask spread; we cross half of it
@@ -58,6 +101,18 @@ stamp_intraday_buy_pct = 0.003
 stamp_delivery_buy_pct = 0.015
 gst_pct = 18.0
 dp_charge_per_sell = 15.93
+
+[email]
+# An email when a stock is bought: the Judge's final decision and its reason to buy.
+# Login goes in .env, never here: ARENA_SMTP_USER and ARENA_SMTP_PASSWORD (a Gmail app password).
+enabled = true
+to = ""                 # recipient; better kept in .env as ARENA_MAIL_TO (defaults to ARENA_SMTP_USER)
+buys = true             # email each stock actually bought, with the Judge's reason
+each_verdict = false    # true = also email every don't-buy / sell / hold verdict
+exits = false           # true = also email automatic stop-loss / target exits
+daily = false           # true = end-of-day summary email
+smtp_host = "smtp.gmail.com"
+smtp_port = 465
 
 [report]
 refresh_seconds = 60

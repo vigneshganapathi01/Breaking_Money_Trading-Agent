@@ -37,6 +37,13 @@ _ALLOWED = [
     ("api.upstox.com", r"^/v2/login/authorization/token$", {"POST"}),
     ("api.upstox.com", r"^/v2/user/profile$", {"GET"}),
     ("assets.upstox.com", r"^/market-quote/instruments/", {"GET"}),
+    # NSE's official public RSS feeds (corporate announcements, results). Read-only research, not price scraping.
+    ("nsearchives.nseindia.com", r"^/content/RSS/[A-Za-z_]+\.xml$", {"GET"}),
+    # Public news RSS feeds (headlines only): context for the debate agents.
+    ("news.google.com", r"^/rss/search$", {"GET"}),
+    ("economictimes.indiatimes.com", r"^/markets/(stocks/)?rssfeeds/\d+\.cms$", {"GET"}),
+    ("www.moneycontrol.com", r"^/rss/[a-z]+\.xml$", {"GET"}),
+    ("www.livemint.com", r"^/rss/markets$", {"GET"}),
 ]
 
 # Belt and braces: even an allowed host is refused if the path smells like trading.

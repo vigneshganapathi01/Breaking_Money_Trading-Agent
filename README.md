@@ -90,6 +90,35 @@ Want to try your own strategy idea? Write it in plain English in **Settings → 
 - **Risk rules** on every price poll: per-trade stop-loss and target, a daily loss kill switch (`max_daily_loss_pct`), no new entries after 14:45, and auto square-off at 15:15 in intraday mode.
 - **Long-only V1.** BUY opens, SELL closes. Short selling is a later version.
 
+## Multi-agent debate mode (Bull vs Bear, Judge decides)
+
+Debate mode is the default (`brain = "debate"`). **Every trade the agent takes is decided by the Judge.** The strategy (`[debate] proposer`, the free rules by default) only *proposes* BUY/SELL ideas. Each proposal is debated by Bull and Bear, and it is **taken** only if the Judge approves it and the risk guard agrees. Otherwise it is **left**. Market events (price moves, volume spikes, breakouts, SMA crosses, material NSE filings) can also start a debate on their own.
+
+`require_judge = true` enforces this at the engine boundary. In debate mode, and in every live session, a BUY/SELL is executed only if it matches a completed debate's final verdict exactly: same run, same stock, same action. Anything else is rejected with "no Judge approval", including the rules fallback when Claude is down. Automatic risk exits (stop-loss, target, daily loss kill switch, 15:15 square-off) are not debated: they protect the account and always run. Without Claude access (an API key or Claude Code login), no debate can finish, so **no new trades are taken**.
+
+```
+ strategy proposal (BUY/SELL idea) or event (price move, volume spike, breakout, SMA cross, material NSE filing)
+   └─► frozen market snapshot (hashed) + related NSE filings
+         └─► 🐂 Bull opening ─┐
+             🐻 Bear opening ─┤ (independent)
+             🐻 Bear challenges ► 🐂 Bull answers   (× rounds)
+             🐻 Bear final counterarguments
+               └─► ⚖️ Judge: PAPER_BUY / PAPER_SELL / HOLD / SKIP (Pydantic-validated)
+                     └─► risk guard (can only downgrade) ► existing PaperBroker ► SQLite journal
+```
+
+- **The engine still owns the money.** The Judge's verdict becomes a normal BUY/SELL/HOLD decision. Sizing, cash checks, charges, slippage, stops, targets, the daily loss limit and square-off are unchanged.
+- **The risk guard** turns a buy into HOLD when the data is stale (`max_quote_age_seconds`), entries are closed, the stock is already held, positions are full, the Judge's confidence is below `min_judge_confidence`, or the Judge flags stale data. PAPER_SELL without a position is ignored (long-only).
+- **Cost control:** event triggers, a per-stock cooldown, `max_debates_per_cycle`, `max_debates_per_day`, and a daily dollar cap (`max_daily_cost_usd`). Every call's tokens and estimated cost go into the `agent_usage` table. A debate is 6 Claude calls at `rounds = 1`.
+- **Research:** NSE's official RSS feeds for corporate announcements and financial results, polled every `poll_minutes`, de-duplicated, mapped to your watchlist with a confidence score, and flagged *material* by keyword. Filings are stored as facts. The agents' interpretation is stored separately, in the debate events.
+- **Live dashboard:** the control panel's **Debates** tab streams every agent reply as it arrives (Server-Sent Events). It shows the watchlist with sparklines, the research panel, the debate timeline with evidence and risk flags, the Judge's verdict and the guard's notes, the portfolio, agent performance and Claude spend.
+- **Claude access:** `[debate] transport = "claude-cli"` (default: your Claude Code login, no API key; runs with all tools and MCP servers off and saves no chat sessions) or `"claude-api"` (needs `ANTHROPIC_API_KEY` in `.env`). The CLI is found on PATH or in `~/.local/bin`; set `CLAUDE_CLI` to point elsewhere. The copy bundled inside the Claude desktop app is not signed in on its own, so install the standalone CLI and sign in once. Model and effort are set in `[agents]`, with optional per-agent overrides. Current Claude models don't accept a temperature setting, so `effort` is the depth and cost control.
+- **Provider lock:** resuming a challenge with a different `feed` is refused. Start a new challenge to switch provider.
+
+New files: `arena/debate.py` (orchestrator, triggers, guard, `DebateBrain`), `arena/agents.py` (role prompts), `arena/schemas.py` (Pydantic models), `arena/llm.py` (Claude transports, usage and budget), `arena/research.py`, `arena/events.py`, `arena/debate_view.py`, `tests/test_debate.py`.
+
+Not yet included: Upstox WebSocket streaming, FYERS v3 (its official SDK bundles order APIs, which the safety layer blocks, so it needs a read-only adapter), and index (NIFTY) updates. Polling Yahoo or Upstox REST still works as before.
+
 ## Market data
 
 Set `feed` in `config.toml`.
@@ -108,7 +137,7 @@ We do not support Zerodha Kite for this, because Kite's terms restrict virtual/m
 | `python -m arena gui` | Control panel in your browser: Start/Stop, settings, live log and dashboard. `START-TRADING.bat` opens it. |
 | `python -m arena demo [--days 15] [--brain rules\|claude-api]` | Full challenge on synthetic prices. Safe to run any time, offline. |
 | `python -m arena check` | Proves order URLs and broker SDKs are blocked, then tests prices and Claude. |
-| `python -m arena run [--new] [--name "..."]` | Live session. Resumes the active challenge unless you pass `--new`. |
+| `python -m arena run [--new] [--name "..."] [--brain debate]` | Live session. Resumes the active challenge unless you pass `--new`. |
 | `python -m arena fetch [--source yahoo\|upstox] [--days 30]` | Saves past 5-minute bars to `data/history/` for replay. |
 | `python -m arena replay [--days 10 \| --start YYYY-MM-DD --end YYYY-MM-DD]` | Runs the agent through history on a virtual clock. It never sees a future price. |
 | `python -m arena compete --brains rules,claude-api --days 10` | Several strategies, same prices, same capital, leaderboard. |
@@ -141,12 +170,14 @@ arena/
   engine.py      virtual account, fills, stops, square-off
   charges.py     Indian charges (edit rates in config.toml)
   brain.py       Claude API / Claude CLI / rules baseline
+  debate.py      multi-agent debates: triggers, Bull/Bear/Judge, risk guard
+  research.py    official NSE filings feed (facts only)
   runner.py      market loop, used for live, replay and demo
   insights.py    analytics + plain-English observations + Claude coach review
   report.py      the one-page results dashboard
   feeds/         yahoo, upstox, replay, synthetic
 config.toml      all settings
-data/arena.db    SQLite journal (runs, decisions, orders, trades, equity, days)
+data/arena.db    SQLite journal (runs, decisions, orders, trades, equity, days, debates, research, agent usage)
 tests/           python -m unittest discover tests
 ```
 
@@ -160,3 +191,33 @@ tests/           python -m unittest discover tests
 ## Licence and disclaimer
 
 MIT licensed, see [LICENSE](LICENSE). Paper trading only. Not investment advice. Simulated results do not guarantee real-world results. See [DISCLAIMER.md](DISCLAIMER.md).
+
+## Running it unattended (macOS background service)
+
+`~/Library/LaunchAgents/com.breakingmoney.arena.plist` runs the control panel as a background service:
+`arena gui --no-open --port 8800 --lan --resume`, wrapped in `caffeinate -i` so the Mac does not idle-sleep.
+
+- Starts when you log in, and restarts within ~30 s if it crashes. On start it continues the active live challenge
+  (it waits for the next market open, then trades every `decision_minutes`).
+- Pressing **Stop** in the panel is remembered (`data/paused_by_user`): the service will not resume until you press **Resume**.
+- Panel: http://127.0.0.1:8800/ on this Mac (full control). Service output: `data/service.log`.
+- `--lan`: devices on the same Wi-Fi can open http://<this Mac's Wi-Fi IP>:8800/ **view only** (dashboard, debates, live stream). Start/Stop/settings are refused unless the request really comes from this Mac. Remove `--lan` from the plist to stop sharing.
+- Turn it off: `launchctl bootout gui/$(id -u)/com.breakingmoney.arena` (and delete the plist to stop it starting at login).
+- It cannot run while the Mac is shut down, logged out, or asleep with the lid closed.
+
+## Judge verdicts by email
+
+Each Judge decision triggers an email: BUY (with "Why buy"), DON'T BUY (hold or skip, with "Why not") or SELL. The email also says what the engine did, for example "BUY 18 SBIN @ 1085.40" or "rejected: entries closed". Automatic stop-loss and target exits get a short email too. The emails are sent in the background, so trading never waits for them. Set the recipient and choose `each_verdict` / `exits` / `daily` (end-of-day summary, off by default) in `[email]` in `config.toml`. Put the Gmail login in `.env`, never in the config:
+
+```
+ARENA_SMTP_USER=you@gmail.com
+ARENA_SMTP_PASSWORD=<16-character app password from https://myaccount.google.com/apppasswords>
+ARENA_MAIL_TO=where-to-send@example.com   # optional, defaults to ARENA_SMTP_USER
+```
+
+Without these two values, the email is skipped and the log says why. Trading continues either way. You can preview or send a report at any time:
+
+```
+python -m arena email-report --dry-run            # print the latest day's report
+python -m arena email-report --date 2026-11-13    # send that day's report
+```

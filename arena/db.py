@@ -42,7 +42,26 @@ CREATE TABLE IF NOT EXISTS days (
 CREATE TABLE IF NOT EXISTS notes (
   run_id INTEGER, ts TEXT, kind TEXT, text TEXT
 );
+CREATE TABLE IF NOT EXISTS research_items (
+  uid TEXT PRIMARY KEY, source TEXT, ts TEXT, fetched_at TEXT, headline TEXT, summary TEXT, symbols TEXT,
+  url TEXT, extraction_confidence REAL, material INTEGER
+);
+CREATE TABLE IF NOT EXISTS debates (
+  id INTEGER PRIMARY KEY, run_id INTEGER, ts TEXT, symbol TEXT, triggers TEXT, snapshot_json TEXT,
+  snapshot_hash TEXT, research_json TEXT, status TEXT, judge_json TEXT, final_action TEXT, guard_notes TEXT,
+  cost_usd REAL
+);
+CREATE TABLE IF NOT EXISTS debate_events (
+  id INTEGER PRIMARY KEY, debate_id INTEGER, ts TEXT, agent TEXT, kind TEXT, round INTEGER, payload_json TEXT
+);
+CREATE TABLE IF NOT EXISTS agent_usage (
+  id INTEGER PRIMARY KEY, run_id INTEGER, ts TEXT, debate_id INTEGER, agent TEXT, model TEXT,
+  input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, ok INTEGER
+);
 CREATE INDEX IF NOT EXISTS ix_equity_run ON equity(run_id, ts);
+CREATE INDEX IF NOT EXISTS ix_debate_run ON debates(run_id, ts);
+CREATE INDEX IF NOT EXISTS ix_devents ON debate_events(debate_id);
+CREATE INDEX IF NOT EXISTS ix_research_ts ON research_items(ts);
 CREATE INDEX IF NOT EXISTS ix_dec_run ON decisions(run_id, ts);
 """
 

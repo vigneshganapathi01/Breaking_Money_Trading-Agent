@@ -118,20 +118,18 @@ class ClaudeCLIBrain:
     name = "claude-cli"
 
     def __init__(self, cfg: dict):
-        self.exe = shutil.which("claude")
+        from .llm import find_claude
+        self.exe = find_claude()
         if not self.exe:
-            raise RuntimeError("Claude Code CLI not found on PATH. Install it or use brain = 'claude-api'.")
+            raise RuntimeError("Claude Code CLI not found. Install it or use brain = 'claude-api'.")
         self.cfg = cfg
         self.model = cfg["strategy"].get("cli_model") or ""
 
     def _run(self, prompt: str) -> str:
-        cmd = [self.exe, "-p", prompt, "--output-format", "json"]
-        if self.model:
-            cmd += ["--model", self.model]
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if out.returncode != 0:
-            raise RuntimeError(out.stderr.strip()[:500])
-        return json.loads(out.stdout).get("result", "")
+        # Text in, text out: no built-in tools (shell, files, web) and no MCP servers,
+        # so nothing in the prompt can make Claude Code act on this computer.
+        from .llm import run_claude
+        return run_claude(self.exe, prompt, self.model).get("result", "")
 
     def decide(self, ctx: dict) -> dict:
         system, user = build_prompt(ctx, self.cfg)
@@ -190,6 +188,9 @@ def make_brain(cfg: dict):
     name = cfg["strategy"]["brain"]
     if name == "auto":  # Claude Code login if available, else API key, else free rules
         import os
-        name = "claude-cli" if shutil.which("claude") else "claude-api" if os.environ.get("ANTHROPIC_API_KEY") else "rules"
+        from .llm import find_claude
+        name = "claude-cli" if find_claude() else "claude-api" if os.environ.get("ANTHROPIC_API_KEY") else "rules"
         cfg["strategy"]["brain"] = name
+    if name == "debate":  # written reports (coach review) use the debate's Claude connection
+        name = cfg.get("debate", {}).get("transport", "claude-api")
     return {"claude-api": ClaudeAPIBrain, "claude-cli": ClaudeCLIBrain, "rules": RulesBrain}[name](cfg)

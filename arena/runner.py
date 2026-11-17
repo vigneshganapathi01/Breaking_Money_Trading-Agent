@@ -6,8 +6,9 @@ import logging
 import time as _time
 from datetime import datetime, timedelta
 
-from . import insights, report
+from . import insights, mailer, report
 from .brain import RulesBrain, make_brain
+from .debate import judge_approved
 from .clock import CLOSE, is_market_open, next_open, parse_hhmm
 from .db import Journal
 from .engine import PaperBroker
@@ -21,8 +22,23 @@ class Runner:
     def __init__(self, cfg: dict, feed: PriceFeed, journal: Journal, run_id: int, brain=None, report_path=None):
         self.cfg, self.feed, self.j, self.run_id = cfg, feed, journal, run_id
         self.st = cfg["strategy"]
+        if brain is None and cfg["strategy"]["brain"] == "debate":
+            from .debate import DebateBrain
+            from .research import ResearchEngine
+            research = ResearchEngine(cfg, journal, feed.now) if feed.live else None
+            brain = DebateBrain(cfg, journal, run_id, feed.now, research=research)
         self.brain = brain or make_brain(cfg)
+        # Judge gate: in debate mode, and in every live session while [debate] require_judge is on,
+        # a strategy BUY/SELL reaches the engine only with a matching, completed Judge verdict.
+        # (Automatic risk exits - stop-loss, target, kill switch, square-off - are not gated.)
+        self.require_judge = self.brain.name == "debate" or (
+            feed.live and cfg.get("debate", {}).get("require_judge", True))
+        if self.require_judge and self.brain.name != "debate":
+            log.warning("Judge approval is required but brain is '%s': its BUY/SELL calls will be rejected. "
+                        "Set brain = \"debate\" so trades are debated and judged.", self.brain.name)
         self.fallback = RulesBrain(cfg)
+        if getattr(self.brain, "engine", None) is not None:
+            self.brain.engine.between_calls = self.risk_check
         self.broker = PaperBroker(journal, run_id, cfg)
         self.universe = list(dict.fromkeys(cfg["market"]["watchlist"]))
         self.holidays = set(cfg["market"].get("holidays", []))
@@ -78,6 +94,39 @@ class Runner:
         log.info("=== Day %d closed: P&L Rs %+.2f, equity Rs %.2f ===", day_no, end_eq - self.day_start_equity, end_eq)
         self.day = None
         self.write_report()
+        if self.feed.live:
+            mailer.send_day_report(self.cfg, self.j, self.run_id, d)
+
+    def recover_missed_days(self, now: datetime) -> None:
+        """A restart between trading and the close leaves that day unrecorded (no day notes, not counted
+        in the challenge). Record such past days from the saved equity snapshots."""
+        done = {r["date"] for r in self.j.q("SELECT date FROM days WHERE run_id=?", (self.run_id,))}
+        dates = [r["d"] for r in self.j.q(
+            "SELECT DISTINCT substr(ts,1,10) d FROM decisions WHERE run_id=? ORDER BY d", (self.run_id,))]
+        today = now.date().isoformat()
+        closed_today = not is_market_open(now, self.holidays) and now.time() >= self.square_off
+        for d in dates:
+            if d in done or d > today or (d == today and not closed_today):
+                continue
+            last = self.j.one("SELECT equity FROM equity WHERE run_id=? AND substr(ts,1,10)=? ORDER BY ts DESC LIMIT 1",
+                              (self.run_id, d))
+            prev = self.j.one("SELECT end_equity FROM days WHERE run_id=? AND date<? ORDER BY date DESC LIMIT 1",
+                              (self.run_id, d))
+            start_eq = prev["end_equity"] if prev else self.j.one(
+                "SELECT starting_capital FROM runs WHERE id=?", (self.run_id,))["starting_capital"]
+            end_eq = last["equity"] if last else start_eq
+            stats = self.j.one(
+                "SELECT COUNT(*) n, SUM(net_pnl>0) w, SUM(net_pnl<=0) l, COALESCE(SUM(charges),0) c FROM trades "
+                "WHERE run_id=? AND substr(exit_ts,1,10)=?", (self.run_id, d))
+            ndec = self.j.one("SELECT COUNT(*) n FROM decisions WHERE run_id=? AND substr(ts,1,10)=? AND action!='HOLD'",
+                              (self.run_id, d))["n"]
+            day_no = self.days_done() + 1
+            notes = insights.day_insights(self.j, self.run_id, d, start_eq, end_eq)
+            self.j.x("INSERT OR REPLACE INTO days VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (self.run_id, d, day_no, round(start_eq, 2), round(end_eq, 2), round(end_eq - start_eq, 2),
+                      stats["n"], stats["w"] or 0, stats["l"] or 0, round(stats["c"], 2), ndec, json.dumps(notes)))
+            done.add(d)
+            log.info("Recorded missed Day %d (%s): P&L Rs %+.2f, equity Rs %.2f", day_no, d, end_eq - start_eq, end_eq)
 
     # ---- helpers -----------------------------------------------------
     def _quotes(self, symbols: list[str]):
@@ -107,6 +156,7 @@ class Runner:
                     log.warning("Candles for %s failed: %s", s, e)
                     bars = None
                 market[s] = snapshot(quotes[s], bars)
+                market[s]["quote_age_s"] = round(max(0.0, (now - quotes[s].ts).total_seconds()), 1)
         b = self.broker
         positions = [{
             "symbol": p.symbol, "qty": p.qty, "avg_price": p.avg_price, "ltp": p.last_price,
@@ -159,25 +209,37 @@ class Runner:
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (self.run_id, now.isoformat(), sym, act, d.get("allocation_pct", 0), d.get("confidence", 0),
                  d.get("stop_loss_pct", 0), d.get("target_pct", 0), d.get("reason", ""), view, brain.name))
-            did, msg = cur.lastrowid, "hold"
+            did, msg, bought = cur.lastrowid, "hold", False
             q = fresh.get(sym)
-            if act == "BUY":
+            if act in ("BUY", "SELL") and self.require_judge and not judge_approved(self.j, d, self.run_id):
+                msg = "rejected: no Judge approval"
+            elif act == "BUY":
                 if not q:
                     msg = "rejected: no quote"
-                elif not ctx["entries_allowed"]:
+                elif not ctx["entries_allowed"] or self.killed:
                     msg = "rejected: entries closed"
+                elif self.feed.live and (exec_time - q.ts).total_seconds() > self.cfg["market"].get("max_quote_age_seconds", 300):
+                    msg = f"rejected: stale quote ({(exec_time - q.ts).total_seconds():.0f}s old)"
                 elif float(d.get("confidence", 0)) < self.st.get("min_confidence", 0):
                     msg = f"rejected: confidence below {self.st['min_confidence']}"
                 else:
                     sl = d.get("stop_loss_pct") or self.st["default_stop_loss_pct"]
                     tg = d.get("target_pct") or self.st["default_target_pct"]
-                    _, msg = self.broker.buy(exec_time, q, float(d.get("allocation_pct", 0)), float(sl), float(tg), d.get("reason", ""), did)
+                    bought, msg = self.broker.buy(exec_time, q, float(d.get("allocation_pct", 0)), float(sl), float(tg), d.get("reason", ""), did)
             elif act == "SELL":
                 if q and sym in self.broker.positions:
                     _, msg = self.broker.sell(exec_time, q, "ai", d.get("reason", ""), did)
                 else:
                     msg = "ignored: not held"
             self.j.x("UPDATE decisions SET outcome=? WHERE id=?", (msg, did))
+            em = self.cfg.get("email", {})
+            wanted = em.get("each_verdict", False) or (bought and em.get("buys", True))
+            if self.feed.live and d.get("debate_id") and wanted:
+                try:
+                    subj, body = mailer.build_verdict(self.j, self.run_id, d["debate_id"], msg)
+                    mailer.send_async(self.cfg, subj, body, f"Judge verdict #{d['debate_id']}")
+                except Exception as e:
+                    log.warning("Could not build the verdict email: %s", e)
             if act != "HOLD":
                 log.info("[%s] %s %s -> %s", brain.name, act, sym, msg)
 
@@ -185,6 +247,8 @@ class Runner:
     def run(self) -> None:
         poll = self.st["poll_seconds"]
         target_days = self.cfg["account"]["challenge_days"]
+        if self.feed.live:
+            self.recover_missed_days(self.feed.now())
         while True:
             if self.stop_requested:
                 self.broker.snapshot(self.feed.now())
@@ -221,6 +285,37 @@ class Runner:
         self.write_report()
         log.info("Run %d finished. Report: %s", self.run_id, self.report_path)
 
+    def _email_exit(self, m: str) -> None:
+        """Stop-loss / target exits happen without the Judge; email them too so every trade is reported."""
+        if self.feed.live and self.cfg.get("email", {}).get("exits", False):
+            mailer.send_async(self.cfg, f"Auto exit: {m[:90]}",
+                              "PAPER TRADING ONLY. No real money.\n\nAutomatic exit (stop-loss or target), "
+                              f"not a Judge call:\n{m}\n", "auto exit")
+
+    def risk_check(self) -> None:
+        """Stops, targets and the daily-loss kill switch, without a new decision.
+        Called between Claude calls so positions stay protected while a debate runs."""
+        if not self.feed.live or not self.broker.positions:
+            return
+        if _time.time() - getattr(self, "_last_risk_check", 0) < self.st["poll_seconds"]:
+            return
+        self._last_risk_check = _time.time()
+        now = self.feed.now()
+        quotes = self._quotes(list(self.broker.positions))
+        if not quotes:
+            return
+        b = self.broker
+        b.mark(quotes)
+        for m in b.check_exits(now, quotes):
+            log.info(m)
+            self._email_exit(m)
+        if not self.killed and b.equity <= self.day_start_equity * (1 - self.st["max_daily_loss_pct"] / 100):
+            self.killed = True
+            log.warning("Daily loss limit (%.1f%%) hit during a debate. Closing positions, no new entries today.",
+                        self.st["max_daily_loss_pct"])
+            for m in b.square_off_all(now, quotes, "kill_switch"):
+                log.info(m)
+
     def tick(self, now: datetime) -> None:
         symbols = list(dict.fromkeys(self.universe + list(self.broker.positions)))
         quotes = self._quotes(symbols)
@@ -230,6 +325,7 @@ class Runner:
         b.mark(quotes)
         for m in b.check_exits(now, quotes):
             log.info(m)
+            self._email_exit(m)
         t = now.time()
         max_loss = self.st["max_daily_loss_pct"]
         if not self.killed and b.equity <= self.day_start_equity * (1 - max_loss / 100):

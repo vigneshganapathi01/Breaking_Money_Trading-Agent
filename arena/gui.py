@@ -74,6 +74,8 @@ class Controller:
             feed = make_live_feed(cfg)
             run = None if new else j.active_run("live")
             if run:
+                from .__main__ import check_same_feed
+                check_same_feed(run, feed.name)
                 rid = run["id"]
                 log.info("Resuming live run #%d '%s'", rid, run["name"])
             else:
@@ -123,6 +125,28 @@ class Controller:
             write(j, run["id"], cfg["paths"]["report"], live=False)
             log.info("Coach review added to the dashboard.")
         return self._spawn("review", go)
+
+    def _paused_flag(self) -> Path:
+        return Path(self.cfg()["paths"]["data_dir"]) / "paused_by_user"
+
+    def set_paused(self, on: bool) -> None:
+        f = self._paused_flag()
+        if on:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(now_ist().isoformat())
+        elif f.exists():
+            f.unlink()
+
+    def auto_resume(self) -> None:
+        """Background-service start: continue the active live run unless the user pressed Stop."""
+        if self._paused_flag().exists():
+            log.info("Auto-resume skipped: trading was stopped from the panel. Press Resume to continue.")
+            return
+        if not Journal(self.cfg()["paths"]["db"]).active_run("live"):
+            log.info("Auto-resume: no active live challenge. Start one from the panel.")
+            return
+        log.info("Auto-resume: continuing the active live challenge.")
+        self.start_live(False, "")
 
     def stop(self) -> str:
         if self.runner:
@@ -181,7 +205,7 @@ class Controller:
             ("account", "challenge_days"): int(s["challenge_days"]),
             ("market", "feed"): s["feed"] if s["feed"] in ("yahoo", "upstox") else "yahoo",
             ("market", "watchlist"): wl,
-            ("strategy", "brain"): s["brain"] if s["brain"] in ("auto", "claude-cli", "claude-api", "rules") else "auto",
+            ("strategy", "brain"): s["brain"] if s["brain"] in ("auto", "claude-cli", "claude-api", "rules", "debate") else "auto",
             ("strategy", "profile"): "aggressive" if s.get("profile") == "aggressive" else "balanced",
             ("strategy", "decision_minutes"): max(1, int(s["decision_minutes"])),
             ("strategy", "product"): "delivery" if s["product"] == "delivery" else "intraday",
@@ -220,6 +244,9 @@ def set_toml(text: str, section: str, key: str, value) -> str:
     raise KeyError(f"[{section}] not found in config.toml")
 
 
+VIEWER_HTML = '<style>#bstart,#bstop,#bnew,#breview,#bdemo,details.box{display:none!important}</style><div style="position:fixed;top:8px;right:12px;z-index:9;padding:4px 10px;border-radius:999px;border:1px solid #fab219;color:#fab219;font:600 12px system-ui;background:#12141a">VIEW ONLY</div>'
+
+
 def make_handler(ctl: Controller):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -233,12 +260,57 @@ def make_handler(ctl: Controller):
             self.end_headers()
             self.wfile.write(data)
 
+        def _local_host(self) -> bool:
+            # Refuse requests addressed to any other name (blocks DNS-rebinding tricks).
+            port = self.server.server_address[1]
+            return self.headers.get("Host", "") in (f"127.0.0.1:{port}", f"localhost:{port}")
+
+        def _from_this_mac(self) -> bool:
+            # The real connection address (a Host header can be faked; this cannot).
+            import ipaddress
+            return ipaddress.ip_address(self.client_address[0].removeprefix("::ffff:")).is_loopback
+
+        def _lan_viewer(self) -> bool:
+            """A device on the same Wi-Fi, addressing this Mac by its private IP: read-only access."""
+            import ipaddress
+            try:
+                client = ipaddress.ip_address(self.client_address[0].removeprefix("::ffff:"))
+                host, _, port = self.headers.get("Host", "").rpartition(":")
+                return (client.is_private and not client.is_loopback and ipaddress.ip_address(host).is_private
+                        and port == str(self.server.server_address[1]))
+            except ValueError:  # Host is a name, not an IP literal: refuse (blocks DNS rebinding)
+                return False
+
+        def _from_panel(self) -> bool:
+            # Only the panel's own page may send commands. Other websites can't add the
+            # custom header without a CORS preflight, which this server never approves.
+            if not self._from_this_mac() or not self._local_host() or self.headers.get("X-Arena") != "1":
+                return False
+            origin = self.headers.get("Origin")
+            return origin is None or origin == f"http://{self.headers.get('Host')}"
+
         def do_GET(self):
+            viewer = not (self._from_this_mac() and self._local_host())
+            if viewer and not self._lan_viewer():
+                return self._send(403, '{"msg": "forbidden"}')
             path = self.path.split("?")[0]
             if path == "/":
-                return self._send(200, PANEL, "text/html")
+                return self._send(200, PANEL.replace("</body>", VIEWER_HTML + "</body>") if viewer else PANEL,
+                                  "text/html")
             if path == "/api/state":
                 return self._send(200, json.dumps(ctl.state()))
+            if path == "/debates":
+                from .debate_view import PAGE
+                return self._send(200, PAGE, "text/html")
+            if path == "/api/debates":
+                from .debate_view import dashboard_state
+                cfg = ctl.cfg()
+                state = dashboard_state(Journal(cfg["paths"]["db"]), now_ist().date().isoformat(),
+                                        float(cfg.get("debate", {}).get("max_daily_cost_usd", 5.0)),
+                                        plan=cfg.get("debate", {}).get("transport") == "claude-cli")
+                return self._send(200, json.dumps(state, default=str))
+            if path == "/api/stream":
+                return self._stream()
             if path in ("/report", "/demo"):
                 cfg = load_config(ctl.config_path)
                 f = Path(cfg["paths"]["report"]) if path == "/report" else ROOT / "reports" / "demo.html"
@@ -248,14 +320,42 @@ def make_handler(ctl: Controller):
                 return self._send(200, html, "text/html")
             self._send(404, "{}")
 
+        def _stream(self):
+            """Server-Sent Events: debate, research and market events as they happen."""
+            from urllib.parse import parse_qs, urlparse
+            from .events import BUS
+            try:
+                after = int(self.headers.get("Last-Event-ID") or parse_qs(urlparse(self.path).query).get("after", ["0"])[0])
+            except ValueError:
+                after = 0
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                while True:
+                    events = BUS.wait(after, 15)
+                    if not events:
+                        self.wfile.write(b": ping\n\n")
+                    for ev in events:
+                        self.wfile.write(f"id: {ev['seq']}\ndata: {json.dumps(ev, default=str)}\n\n".encode())
+                        after = ev["seq"]
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
         def do_POST(self):
+            if not self._from_panel():
+                return self._send(403, '{"msg": "Blocked: commands are only accepted from the Arena control panel."}')
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
             path = self.path
             try:
                 if path == "/api/start":
+                    ctl.set_paused(False)
                     msg = ctl.start_live(bool(body.get("new")), body.get("name", ""))
                 elif path == "/api/stop":
+                    ctl.set_paused(True)
                     msg = ctl.stop()
                 elif path == "/api/demo":
                     msg = ctl.start_demo(int(body.get("days", 3)))
@@ -272,14 +372,14 @@ def make_handler(ctl: Controller):
     return H
 
 
-def serve(port: int = 8787, open_browser: bool = True) -> None:
+def serve(port: int = 8787, open_browser: bool = True, resume: bool = False, host: str = "127.0.0.1") -> None:
     h = _Buffer()
     h.setFormatter(logging.Formatter("%(asctime)s  %(message)s", "%H:%M:%S"))
     logging.getLogger().addHandler(h)
     ctl = Controller()
     for p in range(port, port + 10):
         try:
-            srv = ThreadingHTTPServer(("127.0.0.1", p), make_handler(ctl))
+            srv = ThreadingHTTPServer((host, p), make_handler(ctl))
             break
         except OSError:
             continue
@@ -289,6 +389,8 @@ def serve(port: int = 8787, open_browser: bool = True) -> None:
     print(f"\n  AI Trading Arena is running at {url}\n  Keep this window open. Close it to quit.\n")
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    if resume:
+        threading.Timer(1.0, ctl.auto_resume).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -347,7 +449,7 @@ iframe{flex:1;border:0;width:100%;background:var(--page)}
   </div>
   <div class="row">
     <button class="go" id="bstart" onclick="start(false)">▶ Start trading</button>
-    <button class="stop" id="bstop" onclick="post('/api/stop')">■ Stop</button>
+    <button class="stop" id="bstop" onclick="if(confirm('Stop trading? It stays stopped, even after a restart, until you press Start or Resume. No debates or emails while stopped.'))post('/api/stop')">■ Stop</button>
   </div>
   <div class="row">
     <button id="bnew" onclick="startNew()">New challenge</button>
@@ -359,7 +461,7 @@ iframe{flex:1;border:0;width:100%;background:var(--page)}
     <div class="grid2">
       <div><label>Starting capital ₹</label><input id="s_starting_capital" type="number"></div>
       <div><label>Challenge days</label><input id="s_challenge_days" type="number"></div>
-      <div><label>Who decides</label><select id="s_brain"><option value="auto">Auto</option><option value="claude-cli">Claude (my login)</option><option value="claude-api">Claude (API key)</option><option value="rules">Rules (free, no AI)</option></select></div>
+      <div><label>Who decides</label><select id="s_brain"><option value="auto">Auto</option><option value="claude-cli">Claude (my login)</option><option value="claude-api">Claude (API key)</option><option value="rules">Rules (free, no AI)</option><option value="debate">Debate: Bull vs Bear, Judge decides</option></select></div>
       <div style="grid-column:1/-1"><label>Risk profile</label><select id="s_profile"><option value="balanced">Balanced (uses the numbers below)</option><option value="aggressive">Aggressive: 3 big bets, A+ setups only, 6% day limit</option></select></div>
       <div><label>Price feed</label><select id="s_feed"><option value="yahoo">Yahoo (free)</option><option value="upstox">Upstox</option></select></div>
       <div><label>Decide every (min)</label><input id="s_decision_minutes" type="number"></div>
@@ -374,17 +476,17 @@ iframe{flex:1;border:0;width:100%;background:var(--page)}
   <div class="box"><div class="small" style="margin-bottom:6px">Activity</div><div id="log"></div></div>
 </aside>
 <main>
-  <div class="tabs"><button class="tab on" id="t_report" onclick="showTab('report')">Live dashboard</button><button class="tab" id="t_demo" onclick="showTab('demo')">Demo</button></div>
+  <div class="tabs"><button class="tab on" id="t_report" onclick="showTab('report')">Live dashboard</button><button class="tab" id="t_debates" onclick="showTab('debates')">Debates</button><button class="tab" id="t_demo" onclick="showTab('demo')">Demo</button></div>
   <iframe id="frame" src="/report"></iframe>
 </main>
 <script>
 let tab="report",loaded=false;
 const $=id=>document.getElementById(id);
 const rs=v=>(v<0?"−":"")+"₹"+Math.abs(v).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
-async function post(url,body){const r=await fetch(url,{method:"POST",body:JSON.stringify(body||{})});const j=await r.json();$("msg").textContent=j.msg==="ok"?"":j.msg;refresh()}
+async function post(url,body){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","X-Arena":"1"},body:JSON.stringify(body||{})});const j=await r.json();$("msg").textContent=j.msg==="ok"?"":j.msg;refresh()}
 function start(n){post("/api/start",{new:n})}
 function startNew(){const name=prompt("Name for the new challenge","Breaking Money Challenge");if(name!==null)post("/api/start",{new:true,name})}
-function showTab(t){tab=t;$("t_report").classList.toggle("on",t==="report");$("t_demo").classList.toggle("on",t==="demo");reloadFrame()}
+function showTab(t){tab=t;["report","debates","demo"].forEach(x=>$("t_"+x).classList.toggle("on",t===x));reloadFrame()}
 function reloadFrame(){const f=$("frame"),y=f.contentWindow?f.contentWindow.scrollY:0;f.onload=()=>{try{f.contentWindow.scrollTo(0,y)}catch(e){}};f.src="/"+tab+"?t="+Date.now()}
 async function saveSettings(){const s={};["starting_capital","challenge_days","brain","profile","feed","decision_minutes","product","max_position_pct","max_daily_loss_pct","watchlist","notes"].forEach(k=>s[k]=$("s_"+k).value);post("/api/settings",s)}
 async function refresh(){
@@ -392,7 +494,7 @@ async function refresh(){
  const labels={idle:"Idle",live:"Trading live",demo:"Running demo",review:"Writing coach review"};
  $("status").textContent=labels[s.mode]||s.mode;$("dot").classList.toggle("on",s.busy);
  $("market").textContent=(s.market_open?"Market OPEN · ":"Market closed · next open "+s.next_open+" · ")+"IST "+s.now;
- $("brain").textContent="Decisions by: "+({"claude-cli":"Claude (your login)","claude-api":"Claude (API key)","rules":"Rules strategy (no AI)"}[s.brain]||s.brain);
+ $("brain").textContent="Decisions by: "+({"claude-cli":"Claude (your login)","claude-api":"Claude (API key)","rules":"Rules strategy (no AI)","debate":"Multi-agent debate (Bull / Bear / Judge)"}[s.brain]||s.brain);
  $("bstart").disabled=s.busy;$("bnew").disabled=s.busy;$("bdemo").disabled=s.busy;$("breview").disabled=s.busy;$("bstop").disabled=!(s.busy&&s.mode!=="review");
  if(s.error)$("msg").textContent="Error: "+s.error;
  if(s.run){$("runbox").style.display="";$("runname").textContent=s.run.name+" · "+s.run.status;$("equity").textContent=rs(s.run.equity);
@@ -402,5 +504,5 @@ async function refresh(){
  const lg=$("log"),atBottom=lg.scrollTop+lg.clientHeight>=lg.scrollHeight-5;lg.textContent=s.log.join("\n");if(atBottom)lg.scrollTop=lg.scrollHeight;
  if(!loaded){for(const k in s.settings)if($("s_"+k))$("s_"+k).value=s.settings[k];loaded=true}
 }
-refresh();setInterval(refresh,3000);setInterval(reloadFrame,30000);
+refresh();setInterval(refresh,3000);setInterval(()=>{if(tab!=="debates")reloadFrame()},30000);
 </script></body></html>"""
